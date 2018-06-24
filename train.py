@@ -3,6 +3,7 @@ from datetime import datetime
 import math
 import numpy as np
 import os
+import sys
 import subprocess
 import time
 import tensorflow as tf
@@ -52,75 +53,98 @@ def train(log_dir, args):
   log('Using model: %s' % args.model)
   log(hparams_debug_string())
 
-  # Set up DataFeeder:
-  coord = tf.train.Coordinator()
-  with tf.variable_scope('datafeeder') as scope:
-    feeder = DataFeeder(coord, input_path, hparams)
+  ps_hosts = args.ps_hosts.split(",")
+  worker_hosts = args.worker_hosts.split(",")
+  cluster = tf.train.ClusterSpec({"ps": ps_hosts, "worker": worker_hosts})
+  server = tf.train.Server(cluster, job_name=args.job_name,
+                           task_index=args.task_index)
 
-  # Set up model:
-  global_step = tf.Variable(0, name='global_step', trainable=False)
-  with tf.variable_scope('model') as scope:
-    model = create_model(args.model, hparams)
-    model.initialize(feeder.inputs, feeder.input_lengths, feeder.mel_targets, feeder.linear_targets)
-    model.add_loss()
-    model.add_optimizer(global_step)
-    stats = add_stats(model)
+  # Block further graph execution if current node is parameter server
+  if args.job_name == "ps":
+      server.join()
 
-  # Bookkeeping:
-  step = 0
-  time_window = ValueWindow(100)
-  loss_window = ValueWindow(100)
-  saver = tf.train.Saver(max_to_keep=5, keep_checkpoint_every_n_hours=2)
 
-  # Train!
-  with tf.Session() as sess:
-    try:
-      summary_writer = tf.summary.FileWriter(log_dir, sess.graph)
-      sess.run(tf.global_variables_initializer())
+  with tf.device(tf.train.replica_device_setter(
+    worker_device="/job:worker/task:%d" % args.task_index, cluster=cluster)):
 
-      if args.restore_step:
-        # Restore from a checkpoint if the user requested it.
-        restore_path = '%s-%d' % (checkpoint_path, args.restore_step)
-        saver.restore(sess, restore_path)
-        log('Resuming from checkpoint: %s at commit: %s' % (restore_path, commit), slack=True)
-      else:
-        log('Starting new training run at commit: %s' % commit, slack=True)
+    # Set up DataFeeder:
+    coord = tf.train.Coordinator()
+    with tf.variable_scope('datafeeder') as scope:
+      feeder = DataFeeder(coord, input_path, hparams)
 
-      feeder.start_in_session(sess)
+    # Set up model:
+    global_step = tf.Variable(0, name='global_step', trainable=False)
+    with tf.variable_scope('model') as scope:
+      model = create_model(args.model, hparams)
+      model.initialize(feeder.inputs, feeder.input_lengths, feeder.mel_targets, feeder.linear_targets)
+      model.add_loss()
+      model.add_optimizer(global_step)
+      stats = add_stats(model)
 
-      while not coord.should_stop():
-        start_time = time.time()
-        step, loss, opt = sess.run([global_step, model.loss, model.optimize])
-        time_window.append(time.time() - start_time)
-        loss_window.append(loss)
-        message = 'Step %-7d [%.03f sec/step, loss=%.05f, avg_loss=%.05f]' % (
-          step, time_window.average, loss, loss_window.average)
-        log(message, slack=(step % args.checkpoint_interval == 0))
+    # Bookkeeping:
+    step = 0
+    time_window = ValueWindow(100)
+    loss_window = ValueWindow(100)
+    saver = tf.train.Saver(max_to_keep=5, keep_checkpoint_every_n_hours=2, sharded=True)
 
-        if loss > 100 or math.isnan(loss):
-          log('Loss exploded to %.05f at step %d!' % (loss, step), slack=True)
-          raise Exception('Loss Exploded')
+    hooks=[tf.train.StopAtStepHook(last_step=1000000)]
+    # Train!
+    # Monitored... automatycznie wznawia z checkpointu.
+    is_chief = (args.task_index ==0)
+    init_op = tf.global_variables_initializer()
+    sv = tf.train.Supervisor(is_chief=(args.task_index == 0),
+                             logdir="train_logs", init_op=init_op,
+                             summary_op=stats, saver=saver,
+                             save_model_secs=600)
+    with sv.managed_session(server.target) as sess:
+      try:
 
-        if step % args.summary_interval == 0:
-          log('Writing summary at step: %d' % step)
-          summary_writer.add_summary(sess.run(stats), step)
+        summary_writer = tf.summary.FileWriter(log_dir, sess.graph)
+        sess.run(init_op)
 
-        if step % args.checkpoint_interval == 0:
-          log('Saving checkpoint to: %s-%d' % (checkpoint_path, step))
-          saver.save(sess, checkpoint_path, global_step=step)
-          log('Saving audio and alignment...')
-          input_seq, spectrogram, alignment = sess.run([
-            model.inputs[0], model.linear_outputs[0], model.alignments[0]])
-          waveform = audio.inv_spectrogram(spectrogram.T)
-          audio.save_wav(waveform, os.path.join(log_dir, 'step-%d-audio.wav' % step))
-          plot.plot_alignment(alignment, os.path.join(log_dir, 'step-%d-align.png' % step),
-            info='%s, %s, %s, step=%d, loss=%.5f' % (args.model, commit, time_string(), step, loss))
-          log('Input: %s' % sequence_to_text(input_seq))
+        if args.restore_step and is_chief:
+          # Restore from a checkpoint if the user requested it.
+          restore_path = '%s-%d' % (checkpoint_path, args.restore_step)
+          saver.restore(sess, restore_path)
+          log('Resuming from checkpoint: %s at commit: %s' % (restore_path, commit), slack=True)
+        else:
+          log('Starting new training run at commit: %s' % commit, slack=True)
 
-    except Exception as e:
-      log('Exiting due to exception: %s' % e, slack=True)
-      traceback.print_exc()
-      coord.request_stop(e)
+        feeder.start_in_session(sess)
+
+        while not coord.should_stop():
+          start_time = time.time()
+          step, loss, opt = sess.run([global_step, model.loss, model.optimize])
+          time_window.append(time.time() - start_time)
+          loss_window.append(loss)
+          message = 'Step %-7d [%.03f sec/step, loss=%.05f, avg_loss=%.05f]' % (
+            step, time_window.average, loss, loss_window.average)
+          log(message, slack=(step % args.checkpoint_interval == 0))
+
+          if loss > 100 or math.isnan(loss):
+            log('Loss exploded to %.05f at step %d!' % (loss, step), slack=True)
+            raise Exception('Loss Exploded')
+
+          if step % args.summary_interval == 0:
+            log('Writing summary at step: %d' % step)
+            summary_writer.add_summary(sess.run(stats), step)
+
+          if step % args.checkpoint_interval == 0 and is_chief:
+            log('Saving checkpoint to: %s-%d' % (checkpoint_path, step))
+            saver.save(sess, checkpoint_path, global_step=step)
+            log('Saving audio and alignment...')
+            input_seq, spectrogram, alignment = sess.run([
+              model.inputs[0], model.linear_outputs[0], model.alignments[0]])
+            waveform = audio.inv_spectrogram(spectrogram.T)
+            audio.save_wav(waveform, os.path.join(log_dir, 'step-%d-audio.wav' % step))
+            plot.plot_alignment(alignment, os.path.join(log_dir, 'step-%d-align.png' % step),
+              info='%s, %s, %s, step=%d, loss=%.5f' % (args.model, commit, time_string(), step, loss))
+            log('Input: %s' % sequence_to_text(input_seq))
+
+      except Exception as e:
+        log('Exiting due to exception: %s' % e, slack=True)
+        traceback.print_exc()
+        coord.request_stop(e)
 
 
 def main():
@@ -139,7 +163,34 @@ def main():
   parser.add_argument('--slack_url', help='Slack webhook URL to get periodic reports.')
   parser.add_argument('--tf_log_level', type=int, default=1, help='Tensorflow C++ log level.')
   parser.add_argument('--git', action='store_true', help='If set, verify that the client is clean.')
-  args = parser.parse_args()
+  parser.register("type", "bool", lambda v: v.lower() == "true")
+  # Flags for defining the tf.train.ClusterSpec
+  parser.add_argument(
+            "--ps_hosts",
+            type=str,
+            default="",
+            help="Comma-separated list of hostname:port pairs"
+        )
+  parser.add_argument(
+          "--worker_hosts",
+          type=str,
+          default="",
+          help="Comma-separated list of hostname:port pairs"
+      )
+  parser.add_argument(
+            "--job_name",
+            type=str,
+            default="",
+            help="One of 'ps', 'worker'"
+        )
+  # Flags for defining the tf.train.Server
+  parser.add_argument(
+                "--task_index",
+                type=int,
+                default=0,
+                help="Index of task within the job"
+            )
+  args, unparsed = parser.parse_known_args()
   os.environ['TF_CPP_MIN_LOG_LEVEL'] = str(args.tf_log_level)
   run_name = args.name or args.model
   log_dir = os.path.join(args.base_dir, 'logs-%s' % run_name)
